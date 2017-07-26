@@ -1,0 +1,9 @@
+*
+!*/
+!*.md
+!*.sh
+!*.clj
+!*.yml
+!.*ignore
+!Dockerfile
+target/*
