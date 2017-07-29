@@ -14,8 +14,9 @@
     fname
     (str data-folder "/" fname ".edn")))
 
-(defn read-file [fname]
-  (-> fname abs-path slurp edn/read-string))
+(defn read-file [fname & default]
+  (try (-> fname abs-path slurp edn/read-string)
+       (catch java.io.FileNotFoundException e (first default))))
 
 (defn write-file [fname contents]
   (with-open [w (-> fname abs-path clojure.java.io/writer)]
@@ -25,23 +26,20 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (def feeds-by-user     (-> "feeds" read-file atom))
-(def last-seen-by-user (-> "last_seen" read-file atom))
+(def last-seen-by-user (-> "last_seen" (read-file {}) atom))
 (def articles-by-feed
-  (->> (for [feed (->> (u/glob data-folder #"/articles-.+\.edn") (map read-file))]
+  (->> (for [feed (->> (u/glob data-folder #"/articles-.+\.edn$") (map read-file))]
          [(:uri feed) feed])
-       (into {})
-       atom))
+       (into {}) atom))
 
 (def feeds-by-hash (into {} (for [feed (->> @feeds-by-user (mapcat val) (into #{}))]
-                              [(u/sha1-hash feed)
-                               feed])))
+                              [(u/sha1-hash feed) feed])))
 
 (do
   (add-watch last-seen-by-user :last-seen-by-user-to-file
     (fn [key ref old-value new-value]
       (if (not= old-value new-value)
         (write-file "last_seen" new-value))))
-  
   
   (add-watch articles-by-feed :articles-by-feed-to-file
     (fn [key ref old-value new-value]
@@ -72,7 +70,7 @@
                    :title (:title          article)
                    :desc  (-> article :description :value))))
              (u/my-distinct :uri)
-             (sort-by #(-> % :date .getTime -))
+             (sort-by #(some-> % :date .getTime -))
              (take 1000))
         
         result
@@ -81,14 +79,15 @@
           :articles      articles
           :uri           feed-uri
           :title         (:title feed)
-          :latest-date   (-> articles first :date))]
+          :latest-date   (-> articles first :date)
+          :latest-uri    (-> articles first :uri))]
     (swap! articles-by-feed assoc feed-uri result)
     result))
 
 
 (defn read-feeds []
   (->> (cp/upfor 20 [feed (->> @feeds-by-user (mapcat val) (into #{}))]
-         [feed (-> feed read-feed count)])
+         [feed (-> feed read-feed :articles count)])
        (into {})))
 
 
@@ -104,43 +103,23 @@
 
 
 (if (u/getenv "FEED_REFRESH")
-   (periodically #(u/my-println (read-feeds)) (* 30 60 1000)))
+   (periodically #(u/my-println (read-feeds)) (* 30 60 1000))
+   (read-feeds))
 
 
-(let [default-date (java.util.Date. 100 0 1)]
-  (defn get-feeds-by-user
-    ([user]
-     (->> (@feeds-by-user user)
-          (map @articles-by-feed)
-          (sort-by #(-> % :latest-date .getTime -))
-          (map (fn [feed] (assoc feed :articles
-                            (->> feed :articles
-                                 (take-while #(> (-> % :date .getTime)
-                                                 (-> @last-seen-by-user
-                                                     (get user)
-                                                     (get (:uri feed) default-date)
-                                                     .getTime)))
-                                 count))))))))
+(defn get-feeds-by-user [user]
+  (->> (@feeds-by-user user)
+       (map @articles-by-feed)
+       (map (fn [feed] 
+              (let [last-seen-uri (get-in @last-seen-by-user [user (:uri feed)])]
+                (update feed :articles
+                  (fn [articles] (->> articles (take-while #(not= (:uri %) last-seen-uri)) count))))))
+       (sort-by (comp - :articles))))
 
 
 (comment
-  (for [feed (->> @feeds-by-user (mapcat val) (into #{}))]
-     (do (println feed)
-         (-> feed read-feed :articles count)))
-
-  (get-feeds-by-user "nikonyrh")
-  
-  (read-feeds)
-  
-  (-> "https://feeds.yle.fi/uutiset/v1/recent.rss?publisherIds=YLE_UUTISET&concepts=18-34953"
-      read-feed
-      (dissoc :articles :source))
-  
-  (-> "https://utcc.utoronto.ca/~cks/space/blog/?atom"
-      fp/parse-feed
-      :entries
-      first
-      pprint))
+  (for [feed (->> @feeds-by-user (mapcat val) (into #{}))] (do (println feed) (-> feed read-feed :articles count)))
+  (-> "https://feeds.yle.fi/uutiset/v1/recent.rss?publisherIds=YLE_UUTISET&concepts=18-34953" read-feed (dissoc :articles :source)))
 
 
 (defn -ring-handler [request]
@@ -155,28 +134,26 @@
               (let [_     (read-feeds)
                     feeds (get-feeds-by-user user)
                     html  (str
-                            "<html><ul style='list-style-type: none'>\n"
+                            "<html>\n"
                             (->> (for [feed feeds]
-                                   ["  <li>[" (:articles feed) "] <a href='/feeds/" user "/" (u/sha1-hash (:uri feed)) "'>"
-                                    (:title feed)
-                                    "</a>"
-                                    " (" (->> feed :latest-date (.format (java.text.SimpleDateFormat. "yyyy-MM-dd HH:mm:ss"))) ")"
-                                    "</li>\n"])
-                                 flatten
+                                   (let [[bs be] (when (pos? (:articles feed)) ["<b>" "</b>"])]
+                                     (str
+                                       "[" (:articles feed) "] "
+                                       bs "<a href='/feeds/" user "/" (u/sha1-hash (:uri feed)) "'>" (:title feed) "</a>" be
+                                       " (" (or (some->> feed :latest-date (.format (java.text.SimpleDateFormat. "yyyy-MM-dd"))) "????-??-??") ")"
+                                       "<br/>\n")))
                                  clojure.string/join)
-                            "</ul></html>")]
+                            "</html>")]
                html))
         
         #"^/feeds/([^/]+)/([^/]+)$"
         :>> (fn [[user feed-hash]]
               (let [feed-uri (feeds-by-hash feed-hash)
                     feed     (read-feed feed-uri)
-                    _        (swap! last-seen-by-user #(assoc-in % [user feed-uri] (:latest-date feed)))]
+                    _        (swap! last-seen-by-user #(assoc-in % [user feed-uri] (:latest-uri feed)))]
                 (:source (@articles-by-feed feed-uri))))
         
-        (str "<html><pre>"
-             (-> request clojure.pprint/pprint with-out-str)
-             "</pre></html>"))})
+        (str "<html><pre>" (-> request clojure.pprint/pprint with-out-str) "</pre></html>"))})
 
 
 ; lein ring server
